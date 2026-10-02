@@ -48,36 +48,63 @@ class OverlayController(private val service: AccessibilityService) {
     private fun addBubbleTranslation(item: BubbleTranslation) {
         val density = service.resources.displayMetrics.density
         val screenWidth = service.resources.displayMetrics.widthPixels
+        val screenHeight = service.resources.displayMetrics.heightPixels
         val margin = (8 * density).toInt()
-        val minWidth = (150 * density).toInt()
-        val maxWidth = (screenWidth * 0.82f).toInt()
-        val width = item.sourceBounds.width().coerceIn(minWidth, maxWidth)
-        val overlap = (5 * density).toInt()
+        val gap = (5 * density).toInt()
+        val minWidth = (170 * density).toInt()
+        val maxWidth = (screenWidth * 0.88f).toInt()
+
+        // Long Chinese translations need substantially more width than the Korean source bubble.
+        val preferredWidth = when {
+            item.text.length >= 48 -> (screenWidth * 0.88f).toInt()
+            item.text.length >= 26 -> (screenWidth * 0.80f).toInt()
+            item.text.length >= 14 -> maxOf(item.sourceBounds.width(), (screenWidth * 0.62f).toInt())
+            else -> maxOf(item.sourceBounds.width(), minWidth)
+        }
+        val width = preferredWidth.coerceIn(minWidth, maxWidth)
 
         val background = GradientDrawable().apply {
-            setColor(Color.argb(238, 255, 255, 255))
+            setColor(Color.argb(244, 255, 255, 255))
             cornerRadius = 10 * density
-            setStroke((1 * density).toInt().coerceAtLeast(1), Color.argb(38, 0, 0, 0))
+            setStroke((1 * density).toInt().coerceAtLeast(1), Color.argb(42, 0, 0, 0))
         }
 
         val label = TextView(service).apply {
             text = item.text
             textSize = 13f
             setTextColor(Color.rgb(35, 35, 38))
-            setLineSpacing(0f, 1.08f)
+            setLineSpacing(0f, 1.10f)
             setPadding(
-                (8 * density).toInt(),
-                (4 * density).toInt(),
-                (8 * density).toInt(),
-                (4 * density).toInt()
+                (9 * density).toInt(),
+                (6 * density).toInt(),
+                (9 * density).toInt(),
+                (6 * density).toInt()
             )
             this.background = background
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
+            isSingleLine = false
+            maxLines = Int.MAX_VALUE
+            ellipsize = null
         }
 
-        val x = item.sourceBounds.left.coerceIn(margin, (screenWidth - width - margin).coerceAtLeast(margin))
-        val y = (item.sourceBounds.bottom - overlap).coerceAtLeast(margin)
+        // Measure before attaching so a full-height card can be kept on screen.
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY)
+        val heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        label.measure(widthSpec, heightSpec)
+        val measuredHeight = label.measuredHeight.coerceAtLeast((34 * density).toInt())
+
+        val x = item.sourceBounds.left
+            .coerceIn(margin, (screenWidth - width - margin).coerceAtLeast(margin))
+
+        val safeTop = (52 * density).toInt()
+        val safeBottom = screenHeight - (88 * density).toInt()
+        val belowY = item.sourceBounds.bottom + gap
+        val aboveY = item.sourceBounds.top - measuredHeight - gap
+        val y = when {
+            belowY + measuredHeight <= safeBottom -> belowY
+            aboveY >= safeTop -> aboveY
+            else -> belowY.coerceIn(safeTop, (safeBottom - measuredHeight).coerceAtLeast(safeTop))
+        }
+
         val params = WindowManager.LayoutParams().apply {
             this.width = width
             height = WindowManager.LayoutParams.WRAP_CONTENT
