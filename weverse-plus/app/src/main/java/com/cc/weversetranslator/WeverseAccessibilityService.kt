@@ -1,11 +1,13 @@
 package com.cc.weversetranslator
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.util.ArrayDeque
+import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 
 class WeverseAccessibilityService : AccessibilityService() {
@@ -14,19 +16,27 @@ class WeverseAccessibilityService : AccessibilityService() {
         private val HANGUL = Regex("[\\u1100-\\u11FF\\u3130-\\u318F\\uAC00-\\uD7A3]")
     }
 
+    private data class ScreenMessage(
+        val text: String,
+        val bounds: Rect
+    )
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private lateinit var overlay: OverlayController
 
     private val recentContext = ArrayDeque<String>()
-    private var lastVisibleSnapshot: List<String> = emptyList()
+    private val translationCache = object : LinkedHashMap<String, String>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 160
+    }
     private var requestSerial = 0L
+    private var requestInFlight = false
 
     private val scanRunnable = Runnable { scanAndTranslate() }
     private val visibilityWatchdog = object : Runnable {
         override fun run() {
             val pkg = rootInActiveWindow?.packageName?.toString()
-            if (pkg != WEVERSE_PACKAGE) overlay.hide()
+            if (pkg != WEVERSE_PACKAGE) overlay.hideAll()
             mainHandler.postDelayed(this, 900)
         }
     }
@@ -40,7 +50,7 @@ class WeverseAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() != WEVERSE_PACKAGE) return
         mainHandler.removeCallbacks(scanRunnable)
-        mainHandler.postDelayed(scanRunnable, 320)
+        mainHandler.postDelayed(scanRunnable, 260)
     }
 
     override fun onInterrupt() = Unit
@@ -55,64 +65,88 @@ class WeverseAccessibilityService : AccessibilityService() {
     private fun scanAndTranslate() {
         val root = rootInActiveWindow ?: return
         if (root.packageName?.toString() != WEVERSE_PACKAGE) {
-            overlay.hide()
+            overlay.hideAll()
             return
         }
 
-        val visible = linkedSetOf<String>()
-        collectTexts(root, visible)
+        val collected = mutableListOf<ScreenMessage>()
+        collectTexts(root, collected)
+        val visible = filterMessages(collected)
 
-        val korean = visible
-            .map(::normalize)
-            .filter { it.length >= 2 && HANGUL.containsMatchIn(it) }
-            .distinct()
-
-        if (korean.isEmpty()) {
-            lastVisibleSnapshot = emptyList()
+        if (visible.isEmpty()) {
+            overlay.renderTranslations(emptyList())
             return
         }
 
-        val previous = lastVisibleSnapshot.toSet()
-        var newMessages = korean.filter { it !in previous }
-        lastVisibleSnapshot = korean
+        renderCached(visible)
+        if (requestInFlight) return
 
-        if (newMessages.isEmpty()) return
-        newMessages = newMessages.takeLast(4)
-
-        val contextForRequest = recentContext.toList().takeLast(8)
-        newMessages.forEach(::rememberContext)
+        val newMessages = visible.filter { it.text !in translationCache.keys }
+        if (newMessages.isEmpty()) {
+            overlay.hideStatus()
+            visible.forEach { rememberContext(it.text) }
+            return
+        }
 
         if (!AppPrefs.hasPlanAccess(this)) {
-            overlay.show("翻译器：请先打开 Weverse Translator，使用 ChatGPT 登录")
+            overlay.showStatus("请先回翻译器使用 ChatGPT 登录")
             return
         }
 
+        val batch = newMessages.takeLast(8)
+        val firstNewIndex = visible.indexOfFirst { candidate -> batch.any { it.text == candidate.text } }
+        val beforeNew = if (firstNewIndex > 0) visible.take(firstNewIndex).map { it.text } else emptyList()
+        val contextForRequest = (recentContext.toList() + beforeNew).distinct().takeLast(8)
         val serial = ++requestSerial
-        overlay.show("翻译中…")
+        requestInFlight = true
+        overlay.showStatus("翻译中…")
 
         executor.execute {
             val result = runCatching {
-                TranslationClient(this)
-                    .translate(contextForRequest, newMessages)
+                TranslationClient(this).translateLines(
+                    recentContext = contextForRequest,
+                    newMessages = batch.map { it.text }
+                )
             }
 
             mainHandler.post {
+                requestInFlight = false
                 if (serial != requestSerial) return@post
-                result.onSuccess { translated ->
-                    overlay.show(translated)
+                result.onSuccess { translations ->
+                    batch.zip(translations).forEach { (message, translated) ->
+                        translationCache[message.text] = translated
+                        rememberContext(message.text)
+                    }
+                    visible.forEach { rememberContext(it.text) }
+                    overlay.hideStatus()
+                    renderCached(visible)
+                    mainHandler.removeCallbacks(scanRunnable)
+                    mainHandler.postDelayed(scanRunnable, 120)
                 }.onFailure { error ->
-                    overlay.show("翻译失败：${error.message ?: error.javaClass.simpleName}")
+                    overlay.showStatus("翻译失败：${error.message ?: error.javaClass.simpleName}")
                 }
             }
         }
     }
 
-    private fun collectTexts(node: AccessibilityNodeInfo, out: MutableSet<String>) {
-        node.text?.toString()?.trim()?.takeIf { it.isNotBlank() }?.let(out::add)
+    private fun renderCached(visible: List<ScreenMessage>) {
+        val items = visible.mapNotNull { message ->
+            val translated = translationCache[message.text] ?: return@mapNotNull null
+            OverlayController.BubbleTranslation(
+                sourceBounds = Rect(message.bounds),
+                text = translated
+            )
+        }
+        overlay.renderTranslations(items)
+    }
 
-        node.contentDescription?.toString()?.trim()
-            ?.takeIf { it.isNotBlank() && HANGUL.containsMatchIn(it) }
-            ?.let(out::add)
+    private fun collectTexts(node: AccessibilityNodeInfo, out: MutableList<ScreenMessage>) {
+        val text = node.text?.toString()?.let(::normalize).orEmpty()
+        if (text.isNotBlank() && HANGUL.containsMatchIn(text)) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            if (!rect.isEmpty) out += ScreenMessage(text, rect)
+        }
 
         for (i in 0 until node.childCount) {
             node.getChild(i)?.let { child ->
@@ -125,12 +159,50 @@ class WeverseAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun filterMessages(raw: List<ScreenMessage>): List<ScreenMessage> {
+        if (raw.isEmpty()) return emptyList()
+        val density = resources.displayMetrics.density
+        val screenHeight = resources.displayMetrics.heightPixels
+        val headerCutoff = (screenHeight * 0.13f).toInt()
+        val senderLabelMaxHeight = (34 * density).toInt()
+        val senderLabelMaxWidth = (150 * density).toInt()
+
+        val deduped = raw
+            .filter { it.text.isNotBlank() && HANGUL.containsMatchIn(it.text) }
+            .distinctBy {
+                val r = it.bounds
+                "${it.text}|${r.left / 4}|${r.top / 4}|${r.right / 4}|${r.bottom / 4}"
+            }
+            .sortedWith(compareBy<ScreenMessage> { it.bounds.top }.thenBy { it.bounds.left })
+
+        val repeatedShortLabels = deduped
+            .groupBy { it.text }
+            .filter { (text, items) ->
+                text.length <= 12 &&
+                    text.none(Char::isWhitespace) &&
+                    items.size >= 2 &&
+                    items.any { it.bounds.top < (screenHeight * 0.22f).toInt() }
+            }
+            .keys
+
+        return deduped.filter { item ->
+            val r = item.bounds
+            val looksLikeTopTitle = r.top < headerCutoff && item.text.length <= 20
+            val looksLikeSenderLabel =
+                item.text.length <= 12 &&
+                    item.text.none(Char::isWhitespace) &&
+                    r.height() <= senderLabelMaxHeight &&
+                    r.width() <= senderLabelMaxWidth
+            item.text !in repeatedShortLabels && !looksLikeTopTitle && !looksLikeSenderLabel
+        }
+    }
+
     private fun normalize(value: String): String =
         value.replace(Regex("\\s+"), " ").trim()
 
     private fun rememberContext(text: String) {
         if (recentContext.peekLast() == text) return
         recentContext.addLast(text)
-        while (recentContext.size > 12) recentContext.removeFirst()
+        while (recentContext.size > 16) recentContext.removeFirst()
     }
 }
