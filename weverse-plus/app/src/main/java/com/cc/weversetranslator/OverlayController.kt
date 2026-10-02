@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -21,7 +22,7 @@ class OverlayController(private val service: AccessibilityService) {
 
     fun renderTranslations(items: List<BubbleTranslation>) {
         clearBubbleViews()
-        items.takeLast(6).forEach { item -> addBubbleTranslation(item) }
+        items.takeLast(10).forEach { item -> addInlineTranslation(item) }
     }
 
     fun showStatus(text: String) {
@@ -45,69 +46,73 @@ class OverlayController(private val service: AccessibilityService) {
         statusView = null
     }
 
-    private fun addBubbleTranslation(item: BubbleTranslation) {
+    /**
+     * Paint the Chinese translation directly over the Korean text area instead of adding a
+     * separate white card. This keeps every translation attached to its original DM bubble and
+     * prevents long cards from covering neighbouring messages.
+     */
+    private fun addInlineTranslation(item: BubbleTranslation) {
         val density = service.resources.displayMetrics.density
         val screenWidth = service.resources.displayMetrics.widthPixels
         val screenHeight = service.resources.displayMetrics.heightPixels
-        val margin = (8 * density).toInt()
-        val gap = (5 * density).toInt()
-        val minWidth = (170 * density).toInt()
-        val maxWidth = (screenWidth * 0.88f).toInt()
 
-        // Long Chinese translations need substantially more width than the Korean source bubble.
-        val preferredWidth = when {
-            item.text.length >= 48 -> (screenWidth * 0.88f).toInt()
-            item.text.length >= 26 -> (screenWidth * 0.80f).toInt()
-            item.text.length >= 14 -> maxOf(item.sourceBounds.width(), (screenWidth * 0.62f).toInt())
-            else -> maxOf(item.sourceBounds.width(), minWidth)
-        }
-        val width = preferredWidth.coerceIn(minWidth, maxWidth)
+        val horizontalPad = (10 * density).toInt()
+        val verticalPad = (6 * density).toInt()
+        val margin = (4 * density).toInt()
+        val minWidth = (96 * density).toInt()
+        val maxWidth = (screenWidth * 0.72f).toInt()
 
+        val baseWidth = item.sourceBounds.width() + horizontalPad * 2
+        val width = when {
+            item.text.length >= 34 -> maxOf(baseWidth, (screenWidth * 0.68f).toInt())
+            item.text.length >= 20 -> maxOf(baseWidth, (screenWidth * 0.58f).toInt())
+            item.text.length >= 10 -> maxOf(baseWidth, (screenWidth * 0.42f).toInt())
+            else -> baseWidth
+        }.coerceIn(minWidth, maxWidth)
+
+        val minHeight = (38 * density).toInt()
+        val desiredHeight = (item.sourceBounds.height() + verticalPad * 2).coerceAtLeast(minHeight)
+        val maxHeight = (screenHeight * 0.30f).toInt()
+        val height = desiredHeight.coerceAtMost(maxHeight)
+
+        // Approximate Weverse's artist-message cyan so the translation feels like part of the
+        // existing bubble instead of a floating subtitle card.
         val background = GradientDrawable().apply {
-            setColor(Color.argb(244, 255, 255, 255))
-            cornerRadius = 10 * density
-            setStroke((1 * density).toInt().coerceAtLeast(1), Color.argb(42, 0, 0, 0))
+            setColor(Color.argb(252, 188, 239, 243))
+            cornerRadius = 15 * density
         }
 
         val label = TextView(service).apply {
             text = item.text
-            textSize = 13f
-            setTextColor(Color.rgb(35, 35, 38))
-            setLineSpacing(0f, 1.10f)
-            setPadding(
-                (9 * density).toInt(),
-                (6 * density).toInt(),
-                (9 * density).toInt(),
-                (6 * density).toInt()
-            )
+            setTextColor(Color.rgb(28, 30, 32))
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            includeFontPadding = false
+            setLineSpacing(0f, 1.04f)
+            setPadding(horizontalPad, verticalPad, horizontalPad, verticalPad)
             this.background = background
+            elevation = 1.5f * density
             isSingleLine = false
             maxLines = Int.MAX_VALUE
             ellipsize = null
+            setHorizontallyScrolling(false)
+            // Chinese is usually shorter than Korean, but this lets unusually long translations
+            // shrink until they fit inside the source bubble area instead of overflowing.
+            setAutoSizeTextTypeUniformWithConfiguration(
+                10,
+                15,
+                1,
+                TypedValue.COMPLEX_UNIT_SP
+            )
         }
 
-        // Measure before attaching so a full-height card can be kept on screen.
-        val widthSpec = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY)
-        val heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        label.measure(widthSpec, heightSpec)
-        val measuredHeight = label.measuredHeight.coerceAtLeast((34 * density).toInt())
-
-        val x = item.sourceBounds.left
-            .coerceIn(margin, (screenWidth - width - margin).coerceAtLeast(margin))
-
-        val safeTop = (52 * density).toInt()
-        val safeBottom = screenHeight - (88 * density).toInt()
-        val belowY = item.sourceBounds.bottom + gap
-        val aboveY = item.sourceBounds.top - measuredHeight - gap
-        val y = when {
-            belowY + measuredHeight <= safeBottom -> belowY
-            aboveY >= safeTop -> aboveY
-            else -> belowY.coerceIn(safeTop, (safeBottom - measuredHeight).coerceAtLeast(safeTop))
-        }
+        val preferredX = item.sourceBounds.left - horizontalPad
+        val preferredY = item.sourceBounds.top - verticalPad
+        val x = preferredX.coerceIn(margin, (screenWidth - width - margin).coerceAtLeast(margin))
+        val y = preferredY.coerceIn(margin, (screenHeight - height - margin).coerceAtLeast(margin))
 
         val params = WindowManager.LayoutParams().apply {
             this.width = width
-            height = WindowManager.LayoutParams.WRAP_CONTENT
+            this.height = height
             type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -125,17 +130,17 @@ class OverlayController(private val service: AccessibilityService) {
     private fun createStatusView(): TextView {
         val density = service.resources.displayMetrics.density
         val background = GradientDrawable().apply {
-            setColor(Color.argb(225, 32, 32, 36))
+            setColor(Color.argb(215, 32, 32, 36))
             cornerRadius = 14 * density
         }
         val view = TextView(service).apply {
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 12f
             setPadding(
-                (12 * density).toInt(),
-                (7 * density).toInt(),
-                (12 * density).toInt(),
-                (7 * density).toInt()
+                (10 * density).toInt(),
+                (6 * density).toInt(),
+                (10 * density).toInt(),
+                (6 * density).toInt()
             )
             this.background = background
         }
@@ -148,7 +153,7 @@ class OverlayController(private val service: AccessibilityService) {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
             format = android.graphics.PixelFormat.TRANSLUCENT
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = (28 * density).toInt()
+            y = (26 * density).toInt()
         }
         windowManager.addView(view, params)
         return view
