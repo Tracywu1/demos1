@@ -8,6 +8,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.util.ArrayDeque
 import java.util.LinkedHashMap
+import java.util.LinkedHashSet
 import java.util.concurrent.Executors
 
 class WeverseAccessibilityService : AccessibilityService() {
@@ -27,8 +28,11 @@ class WeverseAccessibilityService : AccessibilityService() {
 
     private val recentContext = ArrayDeque<String>()
     private val translationCache = object : LinkedHashMap<String, String>(128, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 160
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 200
     }
+    private val pendingTexts = LinkedHashSet<String>()
+    private var inFlightTexts: List<String> = emptyList()
+    private var latestVisible: List<ScreenMessage> = emptyList()
     private var requestSerial = 0L
     private var requestInFlight = false
 
@@ -50,7 +54,7 @@ class WeverseAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() != WEVERSE_PACKAGE) return
         mainHandler.removeCallbacks(scanRunnable)
-        mainHandler.postDelayed(scanRunnable, 260)
+        mainHandler.postDelayed(scanRunnable, 180)
     }
 
     override fun onInterrupt() = Unit
@@ -72,19 +76,20 @@ class WeverseAccessibilityService : AccessibilityService() {
         val collected = mutableListOf<ScreenMessage>()
         collectTexts(root, collected)
         val visible = filterMessages(collected)
-
-        if (visible.isEmpty()) {
-            overlay.renderTranslations(emptyList())
-            return
-        }
+        latestVisible = visible
 
         renderCached(visible)
-        if (requestInFlight) return
 
-        val newMessages = visible.filter { it.text !in translationCache.keys }
-        if (newMessages.isEmpty()) {
-            overlay.hideStatus()
-            visible.forEach { rememberContext(it.text) }
+        // Every untranslated message is queued immediately, even while another request is in flight.
+        // This prevents messages from being lost when the user scrolls or Weverse updates rapidly.
+        visible.forEach { message ->
+            if (message.text !in translationCache && message.text !in inFlightTexts) {
+                pendingTexts.add(message.text)
+            }
+        }
+
+        if (pendingTexts.isEmpty()) {
+            if (!requestInFlight) overlay.hideStatus()
             return
         }
 
@@ -93,10 +98,27 @@ class WeverseAccessibilityService : AccessibilityService() {
             return
         }
 
-        val batch = newMessages.takeLast(8)
-        val firstNewIndex = visible.indexOfFirst { candidate -> batch.any { it.text == candidate.text } }
-        val beforeNew = if (firstNewIndex > 0) visible.take(firstNewIndex).map { it.text } else emptyList()
-        val contextForRequest = (recentContext.toList() + beforeNew).distinct().takeLast(8)
+        startNextBatchIfIdle()
+    }
+
+    private fun startNextBatchIfIdle() {
+        if (requestInFlight || pendingTexts.isEmpty()) return
+
+        val batchTexts = pendingTexts.take(8)
+        batchTexts.forEach { pendingTexts.remove(it) }
+        inFlightTexts = batchTexts
+
+        val batchSet = batchTexts.toSet()
+        val firstNewIndex = latestVisible.indexOfFirst { it.text in batchSet }
+        val beforeNew = if (firstNewIndex > 0) {
+            latestVisible.take(firstNewIndex).map { it.text }
+        } else {
+            emptyList()
+        }
+        val contextForRequest = (recentContext.toList() + beforeNew)
+            .distinct()
+            .takeLast(8)
+
         val serial = ++requestSerial
         requestInFlight = true
         overlay.showStatus("翻译中…")
@@ -105,24 +127,36 @@ class WeverseAccessibilityService : AccessibilityService() {
             val result = runCatching {
                 TranslationClient(this).translateLines(
                     recentContext = contextForRequest,
-                    newMessages = batch.map { it.text }
+                    newMessages = batchTexts
                 )
             }
 
             mainHandler.post {
                 requestInFlight = false
+                inFlightTexts = emptyList()
                 if (serial != requestSerial) return@post
+
                 result.onSuccess { translations ->
-                    batch.zip(translations).forEach { (message, translated) ->
-                        translationCache[message.text] = translated
-                        rememberContext(message.text)
+                    batchTexts.zip(translations).forEach { (source, translated) ->
+                        translationCache[source] = translated
+                        rememberContext(source)
                     }
-                    visible.forEach { rememberContext(it.text) }
-                    overlay.hideStatus()
-                    renderCached(visible)
+                    renderCached(latestVisible)
+
+                    if (pendingTexts.isEmpty()) {
+                        overlay.hideStatus()
+                    } else {
+                        startNextBatchIfIdle()
+                    }
+
+                    // Re-scan once after a successful batch. This catches nodes that appeared
+                    // during the network request even when Weverse emitted no further event.
                     mainHandler.removeCallbacks(scanRunnable)
                     mainHandler.postDelayed(scanRunnable, 120)
                 }.onFailure { error ->
+                    // Only successful translations enter the cache. Failed items remain pending
+                    // and can be retried on the next Weverse UI event.
+                    batchTexts.forEach { pendingTexts.add(it) }
                     overlay.showStatus("翻译失败：${error.message ?: error.javaClass.simpleName}")
                 }
             }
@@ -161,11 +195,9 @@ class WeverseAccessibilityService : AccessibilityService() {
 
     private fun filterMessages(raw: List<ScreenMessage>): List<ScreenMessage> {
         if (raw.isEmpty()) return emptyList()
-        val density = resources.displayMetrics.density
+
         val screenHeight = resources.displayMetrics.heightPixels
         val headerCutoff = (screenHeight * 0.13f).toInt()
-        val senderLabelMaxHeight = (34 * density).toInt()
-        val senderLabelMaxWidth = (150 * density).toInt()
 
         val deduped = raw
             .filter { it.text.isNotBlank() && HANGUL.containsMatchIn(it.text) }
@@ -175,25 +207,18 @@ class WeverseAccessibilityService : AccessibilityService() {
             }
             .sortedWith(compareBy<ScreenMessage> { it.bounds.top }.thenBy { it.bounds.left })
 
-        val repeatedShortLabels = deduped
-            .groupBy { it.text }
-            .filter { (text, items) ->
-                text.length <= 12 &&
-                    text.none(Char::isWhitespace) &&
-                    items.size >= 2 &&
-                    items.any { it.bounds.top < (screenHeight * 0.22f).toInt() }
-            }
-            .keys
+        // The artist name appears once in the top title and is repeated beside message groups.
+        // Filtering by the actual top title is much safer than filtering all short Korean text,
+        // because real messages such as "얍", "이거까지" and "씻고왔다" are also short.
+        val headerNames = deduped
+            .filter { it.bounds.top < headerCutoff && it.text.length <= 24 }
+            .map { it.text }
+            .toSet()
 
         return deduped.filter { item ->
-            val r = item.bounds
-            val looksLikeTopTitle = r.top < headerCutoff && item.text.length <= 20
-            val looksLikeSenderLabel =
-                item.text.length <= 12 &&
-                    item.text.none(Char::isWhitespace) &&
-                    r.height() <= senderLabelMaxHeight &&
-                    r.width() <= senderLabelMaxWidth
-            item.text !in repeatedShortLabels && !looksLikeTopTitle && !looksLikeSenderLabel
+            val isHeader = item.bounds.top < headerCutoff
+            val isSenderName = !isHeader && item.text in headerNames
+            !isHeader && !isSenderName
         }
     }
 
