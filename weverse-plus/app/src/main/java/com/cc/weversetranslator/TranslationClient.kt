@@ -13,19 +13,23 @@ class TranslationClient(private val context: Context) {
         private const val API_ROOT = "https://api.openai.com/v1"
     }
 
-    fun translate(recentContext: List<String>, newMessages: List<String>): String {
+    fun translate(recentContext: List<String>, newMessages: List<String>): String =
+        translateLines(recentContext, newMessages).joinToString("\n")
+
+    fun translateLines(recentContext: List<String>, newMessages: List<String>): List<String> {
         require(newMessages.isNotEmpty()) { "当前没有待翻译消息" }
         val token = OpenAiAuth(context).validAccessToken()
         var model = AppPrefs.model(context)
         if (model.isBlank()) model = chooseModel(token)
 
-        return try {
+        val raw = try {
             streamTranslation(token, model, recentContext, newMessages)
         } catch (e: ModelUnavailableException) {
             AppPrefs.clearModel(context)
             model = chooseModel(token)
             streamTranslation(token, model, recentContext, newMessages)
         }
+        return parseTranslationLines(raw, newMessages.size)
     }
 
     private fun chooseModel(token: String): String {
@@ -74,10 +78,11 @@ class TranslationClient(private val context: Context) {
         val instructions = """
             你是韩语到简体中文的聊天翻译器，场景是艺人与粉丝的即时私信。
             结合上下文处理省略主语、口语、ㅋㅋ、ㅎㅎ、ㅠㅠ、昵称、网络用语和连续短句。
-            翻译使用自然中文口语，保留 emoji、颜文字和语气。
+            中文要像中国年轻人在微信里自然聊天，避免书面翻译腔。
+            忠实保留原文的亲密程度、撒娇感、语气词、称呼、emoji 和颜文字，不自行增加暧昧含义。
             遇到歧义时采用最符合上下文的解释。
-            只输出翻译结果，不解释，不添加标题。
-            多条消息按原顺序逐行输出，每条对应一行。
+            必须严格输出 JSON 字符串数组，数组长度必须与待翻译消息数量完全一致。
+            每个数组元素只放对应消息的中文翻译，不加编号、标题、解释或 Markdown。
         """.trimIndent()
 
         val userText = buildString {
@@ -87,7 +92,9 @@ class TranslationClient(private val context: Context) {
                 append('\n')
             }
             append("待翻译消息：\n")
-            newMessages.forEach { append("- ").append(it).append('\n') }
+            newMessages.forEachIndexed { index, value ->
+                append(index + 1).append(". ").append(value).append('\n')
+            }
         }
 
         val input = JSONArray().put(
@@ -138,9 +145,7 @@ class TranslationClient(private val context: Context) {
                         "response.completed" -> completed = true
                         "response.failed" -> {
                             val err = event.optJSONObject("response")?.optJSONObject("error")
-                            val errCode = err?.optString("code").orEmpty()
-                            val message = err?.optString("message").orEmpty()
-                            failure = friendlyError(errCode, message)
+                            failure = friendlyError(err?.optString("code").orEmpty(), err?.optString("message").orEmpty())
                         }
                         "error" -> {
                             val err = event.optJSONObject("error")
@@ -155,6 +160,25 @@ class TranslationClient(private val context: Context) {
         } finally {
             conn.disconnect()
         }
+    }
+
+    private fun parseTranslationLines(raw: String, expected: Int): List<String> {
+        val cleaned = raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        val array = runCatching { JSONArray(cleaned) }.getOrNull()
+        if (array != null && array.length() == expected) {
+            return List(expected) { index -> array.optString(index).trim() }
+        }
+
+        val fallback = cleaned.lines()
+            .map { it.trim().removePrefix("-").trim() }
+            .filter { it.isNotBlank() }
+        if (fallback.size == expected) return fallback
+        error("翻译结果条数与原消息不一致，请重试")
     }
 
     private fun formatHttpError(code: Int, raw: String): String {
